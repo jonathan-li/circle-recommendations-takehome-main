@@ -1,40 +1,41 @@
-from fastapi import FastAPI
-import json
-from pathlib import Path
+from fastapi import FastAPI, HTTPException, Query
 
-DATA_DIR = Path(__file__).resolve().parent.parent / "data"
+from src.config.loader import load_json
+from src.services.recommendations import recommend_circles
 
-def load_json(filename: str):
-    data_file_path = DATA_DIR / filename
-    with open(data_file_path, "r", encoding="utf-8") as f:
-        return json.load(f)
-
-users = load_json("users.json")
-topics = load_json("topics.json")
-memberships = load_json("memberships.json")
+users = {user["id"]: user for user in load_json("users.json")}
 circles = load_json("circles.json")
-activity = load_json("activity.json")
+memberships = load_json("memberships.json")
+topics = {topic["slug"]: topic["label"] for topic in load_json("topics.json")}
+user_circle_memberships = {
+    (membership["user_id"], membership["circle_id"])
+    for membership in memberships
+}
 
-user_circle_memberships = set(
-    (m["user_id"], m["circle_id"]) for m in memberships
-)
-def is_already_member(user_id: int, circle_id: int, memberships_set) -> bool:
-    return (user_id, circle_id) in memberships_set
-app = FastAPI()
+app = FastAPI(title="Circle Recommendations API")
 
-@app.get("/health") #Testing APP works
-async def check_health():
+
+@app.get("/health")
+def check_health():
     return {"status": "ok"}
 
+
 @app.get("/recommendations")
-async def get_recommendations(user_id: int, limit: int = 5):
-    user = next((u for u in users if u["id"] == user_id), None)
-    if not user:
-        return {"error": "User not found"}
-    
+def get_recommendations(
+    user_id: int,
+    limit: int = Query(default=5, ge=1, le=10),
+):
+    user = users.get(user_id)
+    if user is None:
+        raise HTTPException(status_code=404, detail="User not found")
+
     return {
-        "user_id": user["id"],
-        "recommendations": 
-            [(c["id"], c["name"]) for c in circles if c["topic"] in user["topic_interests"] 
-             and is_already_member(user["id"], c["id"], user_circle_memberships) is False][:limit]
-    }    
+        "user_id": user_id,
+        "recommendations": recommend_circles(
+            user=user,
+            circles=circles,
+            memberships=user_circle_memberships,
+            topic_labels=topics,
+            limit=limit,
+        ),
+    }
