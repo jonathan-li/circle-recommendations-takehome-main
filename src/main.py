@@ -30,7 +30,7 @@ def check_health():
 @app.get("/recommendations")
 def get_recommendations(
     user_id: int,
-    limit: int = Query(default=5, ge=1, le=10),
+    limit: int = Query(default=5, ge=1, le=20),
 ):
     user = users.get(user_id)
     if user is None:

@@ -1,18 +1,30 @@
+from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
+from math import ceil
 from typing import Any
 
 INACTIVE_AFTER = timedelta(days=90)
 MAX_PER_TOPIC_FIRST_PASS = 2
+HIGH_MEMBER_ACTIVITY_RATIO = 0.4
 LEADER_REASON = (
     "You are a designated leader of this Circle — jump in to check recent "
     "member discussions."
 )
 
 
+@dataclass(frozen=True)
+class ActivityMetrics:
+    active_member_ratio: float = 0.0
+    recent_reactions: int = 0
+    recent_comments: int = 0
+
+
+def _parse_datetime(value: str) -> datetime:
+    return datetime.fromisoformat(value.replace("Z", "+00:00"))
+
+
 def _last_activity(circle: dict[str, Any]) -> datetime:
-    return datetime.fromisoformat(
-        circle["last_activity_at"].replace("Z", "+00:00")
-    )
+    return _parse_datetime(circle["last_activity_at"])
 
 
 def _is_full(circle: dict[str, Any]) -> bool:
@@ -23,7 +35,7 @@ def _is_full(circle: dict[str, Any]) -> bool:
 def _is_inactive(circle: dict[str, Any], now: datetime) -> bool:
     return (
         now - _last_activity(circle) > INACTIVE_AFTER
-        and circle["feed_posts_30d"] == 0
+        and circle["feed_posts_30d"] <= 0
         and circle["chat_messages_30d"] <= 5
     )
 
@@ -35,47 +47,37 @@ def _matching_tags(circle: dict[str, Any], interests: set[str]) -> set[str]:
 def _recent_activity_metrics(
     circles: list[dict[str, Any]],
     activity_records: list[dict[str, Any]],
-) -> dict[int, dict[str, int | float]]:
+) -> dict[int, ActivityMetrics]:
     timestamps = [_last_activity(circle) for circle in circles]
-    timestamps.extend(
-        datetime.fromisoformat(post["created_at"].replace("Z", "+00:00"))
-        for post in activity_records
-    )
+    timestamps.extend(_parse_datetime(post["created_at"]) for post in activity_records)
     if not timestamps:
-        return {
-            circle["id"]: {
-                "active_member_ratio": 0.0,
-                "recent_reactions": 0,
-                "recent_comments": 0,
-            }
-            for circle in circles
-        }
+        return {circle["id"]: ActivityMetrics() for circle in circles}
 
-    snapshot_at = max(timestamps)
-    window_start = snapshot_at - timedelta(days=30)
+    window_end = max(timestamps)
+    window_start = window_end - timedelta(days=30)
     active_authors: dict[int, set[int]] = {}
     reactions: dict[int, int] = {}
     comments: dict[int, int] = {}
+
     for post in activity_records:
-        created_at = datetime.fromisoformat(
-            post["created_at"].replace("Z", "+00:00")
-        )
-        if window_start <= created_at <= snapshot_at:
-            circle_id = post["circle_id"]
-            active_authors.setdefault(circle_id, set()).add(post["author_user_id"])
-            reactions[circle_id] = reactions.get(circle_id, 0) + post["reaction_count"]
-            comments[circle_id] = comments.get(circle_id, 0) + post["comment_count"]
+        if not window_start <= _parse_datetime(post["created_at"]) <= window_end:
+            continue
+
+        circle_id = post["circle_id"]
+        active_authors.setdefault(circle_id, set()).add(post["author_user_id"])
+        reactions[circle_id] = reactions.get(circle_id, 0) + post["reaction_count"]
+        comments[circle_id] = comments.get(circle_id, 0) + post["comment_count"]
 
     return {
-        circle["id"]: {
-            "active_member_ratio": (
+        circle["id"]: ActivityMetrics(
+            active_member_ratio=(
                 len(active_authors.get(circle["id"], set())) / circle["member_count"]
                 if circle["member_count"] > 0
                 else 0.0
             ),
-            "recent_reactions": reactions.get(circle["id"], 0),
-            "recent_comments": comments.get(circle["id"], 0),
-        }
+            recent_reactions=reactions.get(circle["id"], 0),
+            recent_comments=comments.get(circle["id"], 0),
+        )
         for circle in circles
     }
 
@@ -84,9 +86,8 @@ def _reason(
     circle: dict[str, Any],
     interests: set[str],
     topic_labels: dict[str, str],
-    active_member_ratio: float,
-    recent_reactions: int,
-    recent_comments: int,
+    activity: ActivityMetrics,
+    high_recent_engagement: bool,
 ) -> str:
     topic = circle["topic"]
     if topic in interests:
@@ -100,36 +101,76 @@ def _reason(
             "and has recent activity."
         )
     else:
-        reason = "Trending HOT: a public Circle with recent activity."
+        reason = "A public Circle with recent activity."
 
-    participation = round(active_member_ratio * 100)
-    reason += f" {participation}% of members posted in the last 30 days."
-    if recent_reactions or recent_comments:
-        reaction_label = "reaction" if recent_reactions == 1 else "reactions"
-        comment_label = "comment" if recent_comments == 1 else "comments"
-        reason += (
-            f" Recent posts received {recent_reactions} {reaction_label} and "
-            f"{recent_comments} {comment_label}."
-        )
+    if activity.active_member_ratio >= HIGH_MEMBER_ACTIVITY_RATIO:
+        reason += " High member activity."
+    if high_recent_engagement:
+        reason += " High recent engagement."
 
     if circle["join_policy"] == "request":
         reason += " You'll need to request to join."
     return reason
 
 
+def _high_engagement_circle_ids(
+    circles: list[dict[str, Any]],
+    activity_by_circle: dict[int, ActivityMetrics],
+) -> set[int]:
+    scores = {
+        circle["id"]: (
+            activity_by_circle[circle["id"]].recent_reactions
+            + activity_by_circle[circle["id"]].recent_comments
+        )
+        for circle in circles
+    }
+    positive_scores = sorted(
+        (score for score in scores.values() if score > 0),
+        reverse=True,
+    )
+    if not positive_scores:
+        return set()
+
+    top_quartile_size = ceil(len(circles) * 0.25)
+    threshold = positive_scores[min(top_quartile_size, len(positive_scores)) - 1]
+    return {
+        circle_id
+        for circle_id, score in scores.items()
+        if score >= threshold and score > 0
+    }
+
+
 def _recommendation(
     circle: dict[str, Any],
     reason: str,
-    activity_metrics: dict[int, dict[str, int | float]],
-) -> dict[str, Any]:
+) -> dict[str, str | int]:
     return {
         "circle_id": circle["id"],
         "name": circle["name"],
-        "active_member_ratio": round(
-            float(activity_metrics[circle["id"]]["active_member_ratio"]), 3
-        ),
         "reason": reason,
     }
+
+
+def _select_diverse_circles(
+    circles: list[dict[str, Any]],
+    limit: int,
+) -> list[dict[str, Any]]:
+    selected: list[dict[str, Any]] = []
+    deferred: list[dict[str, Any]] = []
+    topic_counts: dict[str, int] = {}
+
+    for circle in circles:
+        topic = circle["topic"] or f"circle-{circle['id']}"
+        if topic_counts.get(topic, 0) >= MAX_PER_TOPIC_FIRST_PASS:
+            deferred.append(circle)
+            continue
+
+        selected.append(circle)
+        topic_counts[topic] = topic_counts.get(topic, 0) + 1
+        if len(selected) == limit:
+            return selected
+
+    return (selected + deferred)[:limit]
 
 
 def recommend_circles(
@@ -142,11 +183,11 @@ def recommend_circles(
     limit: int = 5,
     now: datetime | None = None,
 ) -> list[dict[str, Any]]:
-    """Return eligible Circles ranked by relevance and Circle-level activity."""
+    """Rank leader Circles first, then eligible interest and trending matches."""
     current_time = now or datetime.now(timezone.utc)
     interests = set(user["topic_interests"])
     user_id = user["id"]
-    activity_metrics = _recent_activity_metrics(circles, activity_records)
+    activity_by_circle = _recent_activity_metrics(circles, activity_records)
     circles_by_id = {circle["id"]: circle for circle in circles}
 
     leader_circles = [
@@ -157,19 +198,17 @@ def recommend_circles(
     leader_circles.sort(
         key=lambda circle: (
             _last_activity(circle),
-            circle["feed_posts_30d"],
-            circle["chat_messages_30d"],
             -circle["id"],
         ),
         reverse=True,
     )
-    leader_recommendations = [
-        _recommendation(circle, LEADER_REASON, activity_metrics)
+    recommendations = [
+        _recommendation(circle, LEADER_REASON)
         for circle in leader_circles[:limit]
     ]
-    remaining_limit = limit - len(leader_recommendations)
+    remaining_limit = limit - len(recommendations)
     if remaining_limit == 0:
-        return leader_recommendations
+        return recommendations
 
     eligible = [
         circle
@@ -184,50 +223,30 @@ def recommend_circles(
         key=lambda circle: (
             circle["topic"] in interests,
             len(_matching_tags(circle, interests)),
-            int(activity_metrics[circle["id"]]["recent_reactions"])
-            + int(activity_metrics[circle["id"]]["recent_comments"]),
+            activity_by_circle[circle["id"]].recent_reactions
+            + activity_by_circle[circle["id"]].recent_comments,
             _last_activity(circle),
-            circle["feed_posts_30d"],
-            circle["chat_messages_30d"],
             -circle["id"],
         ),
         reverse=True,
     )
 
-    selected: list[dict[str, Any]] = []
-    deferred: list[dict[str, Any]] = []
-    topic_counts: dict[str, int] = {}
-    for circle in eligible:
-        topic = circle["topic"] or f"circle-{circle['id']}"
-        if topic_counts.get(topic, 0) >= MAX_PER_TOPIC_FIRST_PASS:
-            deferred.append(circle)
-            continue
-
-        selected.append(circle)
-        topic_counts[topic] = topic_counts.get(topic, 0) + 1
-        if len(selected) == remaining_limit:
-            break
-
-    if len(selected) < remaining_limit:
-        selected_ids = {circle["id"] for circle in selected}
-        selected.extend(
-            circle for circle in deferred
-            if circle["id"] not in selected_ids
-        )
-        selected = selected[:remaining_limit]
-
-    return leader_recommendations + [
+    high_engagement_ids = _high_engagement_circle_ids(
+        eligible,
+        activity_by_circle,
+    )
+    selected = _select_diverse_circles(eligible, remaining_limit)
+    recommendations.extend(
         _recommendation(
             circle,
             _reason(
                 circle,
                 interests,
                 topic_labels,
-                float(activity_metrics[circle["id"]]["active_member_ratio"]),
-                int(activity_metrics[circle["id"]]["recent_reactions"]),
-                int(activity_metrics[circle["id"]]["recent_comments"]),
+                activity_by_circle[circle["id"]],
+                circle["id"] in high_engagement_ids,
             ),
-            activity_metrics,
         )
         for circle in selected
-    ]
+    )
+    return recommendations

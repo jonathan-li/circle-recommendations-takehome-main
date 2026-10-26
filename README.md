@@ -6,6 +6,27 @@ the topic taxonomy, and recent Circle feed activity.
 
 Everything here is generated (`generate.mjs`) — no real people, no real content.
 
+## Running the recommendation API
+
+From the repository root, install the Python dependencies and start the server:
+
+```powershell
+python -m pip install -r requirements.txt
+python -m uvicorn src.main:app --reload
+```
+
+Open `http://127.0.0.1:8000/docs` to try the endpoints. For example:
+
+```text
+http://127.0.0.1:8000/recommendations?user_id=7&limit=10
+```
+
+Run the recommendation tests with:
+
+```powershell
+python -m unittest discover -s tests -v
+```
+
 ## Files
 
 | File | Rows | What it is |

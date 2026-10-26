@@ -2,7 +2,7 @@ import unittest
 from datetime import datetime, timezone
 
 from src.config.loader import load_json
-from src.services.recommendations import recommend_circles
+from src.services.recommendations import _recent_activity_metrics, recommend_circles
 
 
 USERS = {user["id"]: user for user in load_json("users.json")}
@@ -142,6 +142,64 @@ class RecommendationTests(unittest.TestCase):
             "recent member discussions.",
         )
 
+    def test_feed_and_chat_counts_do_not_break_ranking_ties(self):
+        user = {"id": 500, "topic_interests": []}
+        common = {
+            "topic": None,
+            "tags": [],
+            "access": "public",
+            "max_members": None,
+            "member_count": 1,
+            "last_activity_at": "2026-10-20T00:00:00Z",
+            "join_policy": "open",
+        }
+        circles = [
+            {
+                **common,
+                "id": 1,
+                "name": "Lower counts",
+                "feed_posts_30d": 0,
+                "chat_messages_30d": 0,
+            },
+            {
+                **common,
+                "id": 2,
+                "name": "Higher counts",
+                "feed_posts_30d": 10,
+                "chat_messages_30d": 20,
+            },
+        ]
+
+        regular_results = recommend_circles(
+            user=user,
+            circles=circles,
+            memberships=set(),
+            leader_circle_ids=set(),
+            activity_records=[],
+            topic_labels={},
+            limit=2,
+            now=NOW,
+        )
+        leader_results = recommend_circles(
+            user=user,
+            circles=circles,
+            memberships={(500, 1), (500, 2)},
+            leader_circle_ids={1, 2},
+            activity_records=[],
+            topic_labels={},
+            limit=2,
+            now=NOW,
+        )
+
+        self.assertEqual(
+            [result["circle_id"] for result in regular_results],
+            [1, 2],
+        )
+        self.assertEqual(
+            [result["circle_id"] for result in leader_results],
+            [1, 2],
+        )
+
     def test_active_member_ratio_counts_distinct_recent_post_authors(self):
         user = {"id": 500, "topic_interests": []}
         circle = {
@@ -188,6 +246,7 @@ class RecommendationTests(unittest.TestCase):
             },
         ]
 
+        metrics = _recent_activity_metrics([circle], activity_records)
         result = recommend_circles(
             user=user,
             circles=[circle],
@@ -199,8 +258,61 @@ class RecommendationTests(unittest.TestCase):
             now=NOW,
         )[0]
 
-        self.assertEqual(result["active_member_ratio"], 0.5)
-        self.assertIn("50% of members posted in the last 30 days", result["reason"])
+        self.assertEqual(metrics[1].active_member_ratio, 0.5)
+        self.assertIn("High member activity", result["reason"])
+        self.assertNotIn("50%", result["reason"])
+        self.assertNotIn("active_member_ratio", result)
+
+    def test_high_member_activity_threshold_is_point_four(self):
+        user = {"id": 500, "topic_interests": []}
+        common = {
+            "topic": None,
+            "tags": [],
+            "access": "public",
+            "max_members": None,
+            "member_count": 5,
+            "last_activity_at": "2026-10-20T00:00:00Z",
+            "feed_posts_30d": 2,
+            "chat_messages_30d": 5,
+            "join_policy": "open",
+        }
+        circles = [
+            {**common, "id": 1, "name": "At threshold"},
+            {**common, "id": 2, "name": "Below threshold"},
+        ]
+        activity_records = [
+            {
+                "circle_id": 1,
+                "author_user_id": author_id,
+                "created_at": "2026-10-19T00:00:00Z",
+                "reaction_count": 0,
+                "comment_count": 0,
+            }
+            for author_id in (10, 11)
+        ] + [
+            {
+                "circle_id": 2,
+                "author_user_id": 20,
+                "created_at": "2026-10-19T00:00:00Z",
+                "reaction_count": 0,
+                "comment_count": 0,
+            }
+        ]
+
+        results = recommend_circles(
+            user=user,
+            circles=circles,
+            memberships=set(),
+            leader_circle_ids=set(),
+            activity_records=activity_records,
+            topic_labels={},
+            limit=2,
+            now=NOW,
+        )
+        by_id = {result["circle_id"]: result for result in results}
+
+        self.assertIn("High member activity", by_id[1]["reason"])
+        self.assertNotIn("High member activity", by_id[2]["reason"])
 
     def test_zero_member_circle_has_zero_active_member_ratio(self):
         user = {"id": 500, "topic_interests": []}
@@ -237,7 +349,8 @@ class RecommendationTests(unittest.TestCase):
             now=NOW,
         )[0]
 
-        self.assertEqual(result["active_member_ratio"], 0.0)
+        self.assertNotIn("High member activity", result["reason"])
+        self.assertNotIn("active_member_ratio", result)
 
     def test_active_member_ratio_does_not_change_ranking(self):
         user = {"id": 500, "topic_interests": []}
@@ -287,10 +400,8 @@ class RecommendationTests(unittest.TestCase):
         )
 
         self.assertEqual([result["circle_id"] for result in results], [1, 2])
-        self.assertLess(
-            results[0]["active_member_ratio"],
-            results[1]["active_member_ratio"],
-        )
+        self.assertNotIn("High member activity", results[0]["reason"])
+        self.assertIn("High member activity", results[1]["reason"])
 
     def test_interest_matches_rank_before_high_engagement_nonmatches(self):
         user = {"id": 500, "topic_interests": ["negotiation"]}
@@ -367,11 +478,64 @@ class RecommendationTests(unittest.TestCase):
         )
 
         self.assertEqual([result["circle_id"] for result in results], [1, 2, 3])
-        self.assertIn("10 reactions and 8 comments", results[1]["reason"])
-        self.assertIn("2 reactions and 1 comment", results[2]["reason"])
-        self.assertIn("Trending HOT", results[1]["reason"])
-        self.assertIn("Trending HOT", results[2]["reason"])
-        self.assertNotIn("Trending HOT", results[0]["reason"])
+        self.assertIn("High recent engagement", results[1]["reason"])
+        self.assertNotIn("High recent engagement", results[2]["reason"])
+        self.assertNotIn("18 reactions", results[1]["reason"])
+        self.assertNotIn("Trending", results[1]["reason"])
+        self.assertNotIn("High recent engagement", results[0]["reason"])
+
+    def test_high_recent_engagement_marks_top_quartile_only(self):
+        user = {"id": 500, "topic_interests": []}
+        circles = [
+            {
+                "id": circle_id,
+                "name": f"Circle {circle_id}",
+                "topic": None,
+                "tags": [],
+                "access": "public",
+                "max_members": None,
+                "member_count": 10,
+                "last_activity_at": "2026-10-20T00:00:00Z",
+                "feed_posts_30d": 2,
+                "chat_messages_30d": 5,
+                "join_policy": "open",
+            }
+            for circle_id in range(1, 5)
+        ]
+        activity_records = [
+            {
+                "circle_id": circle_id,
+                "author_user_id": circle_id,
+                "created_at": "2026-10-19T00:00:00Z",
+                "reaction_count": (5 - circle_id) * 10,
+                "comment_count": 0,
+            }
+            for circle_id in range(1, 5)
+        ]
+
+        results = recommend_circles(
+            user=user,
+            circles=circles,
+            memberships=set(),
+            leader_circle_ids=set(),
+            activity_records=activity_records,
+            topic_labels={},
+            limit=4,
+            now=NOW,
+        )
+        labeled_ids = {
+            result["circle_id"]
+            for result in results
+            if "High recent engagement" in result["reason"]
+        }
+
+        self.assertEqual(labeled_ids, {1})
+        self.assertTrue(
+            all(
+                "received" not in result["reason"]
+                for result in results
+            )
+        )
 
     def test_obvious_matches_rank_before_nonmatches(self):
         results = recommend(7)
@@ -419,11 +583,14 @@ class RecommendationTests(unittest.TestCase):
     def test_limit_is_respected(self):
         self.assertEqual(len(recommend(7, limit=3)), 3)
 
+    def test_limit_of_20_is_supported(self):
+        self.assertEqual(len(recommend(42, limit=20)), 20)
+
     def test_recommendations_have_the_contract_fields(self):
         self.assertTrue(recommend(7))
         self.assertEqual(
             set(recommend(7)[0]),
-            {"circle_id", "name", "reason", "active_member_ratio"},
+            {"circle_id", "name", "reason"},
         )
 
 

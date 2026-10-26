@@ -6,14 +6,13 @@ Return a ranked list of Circles for a member, with a short explanation for each
 recommendation. The first version uses the supplied synthetic JSON dataset and
 the Circle-level activity aggregates. It uses Circle tags as a secondary topic
 match, calculates a recent active-member ratio from post authors, and uses
-recent reactions and comments to rank Circles within a relevance tier. It does
-not use embeddings or profile-based inference.
+recent activity to rank Circles within a relevance tier.
 
 ## API
 
 - `GET /health` returns `{"status": "ok"}`.
 - `GET /recommendations?user_id=<int>&limit=<int>` returns recommendations.
-- `limit` defaults to 5 and must be between 1 and 10.
+- `limit` defaults to 5 and must be between 1 and 20.
 - An unknown `user_id` returns HTTP 404.
 - Invalid/missing query parameters use FastAPI's standard HTTP 422 response.
 - Circles where the requested user has `role=leader` are returned before
@@ -28,8 +27,7 @@ Successful response:
     {
       "circle_id": 5,
       "name": "Women Who Lead",
-      "active_member_ratio": 0.375,
-      "reason": "Matches your interest in leadership skills and has recent activity. 38% of members posted in the last 30 days. Recent posts received 12 reactions and 4 comments."
+      "reason": "Matches your interest in leadership skills and has recent activity. High recent engagement."
     }
   ]
 }
@@ -37,18 +35,31 @@ Successful response:
 
 ## Data and schema
 
+![Architecture diagram](./images/architecture.png)
+
 The running API loads `users.json`, `circles.json`, `memberships.json`,
 `topics.json`, and `activity.json` into memory on process startup. This keeps
 the initial API simple for the small, static assignment dataset. The relational
-SQLite schema is documented separately in [schema.sql](./schema.sql); it is a
-design deliverable, not yet the API's persistence layer.
+SQLite schema is documented separately in [schema.sql](./schema.sql) as a
+database design for this project; the running API does not currently use it.
 
 The schema normalizes topic interests into `user_topic_interests`, references
 the canonical topic lookup from each Circle's optional primary topic, and uses
 `memberships` as the user-to-Circle join table. Circle tags are stored
-separately in `circle_tags`, preserving their source values. Individual
-activity rows are represented in `activity`, referencing their Circle and
-author. Activity aggregates remain columns on `circles`.
+separately in `circle_tags`, and individual activity rows are represented in
+`activity`, referencing their Circle and author. Activity aggregates remain
+columns on `circles`.
+
+## Index rationale
+
+Primary keys and unique constraints support ID lookups and prevent duplicate
+memberships, interests, and tags. The additional indexes support likely
+recommendation queries: `circles(topic_id)` narrows primary-topic matches;
+`memberships(circle_id)` finds a Circle's members; and
+`activity(circle_id, created_at)` retrieves a Circle's recent activity in
+time order. `user_topic_interests(topic_id)` supports reverse lookups from a
+topic to interested users; its primary key already supports loading one user's
+interests. 
 
 ## Eligibility
 
@@ -65,6 +76,8 @@ request is required.
 
 ## Ranking and explanation
 
+First, Circles that users lead are recommended with high priority so they can
+easily check in on activity. Leader Circles contribute to the limit.
 After any leader recommendations, eligible Circles with a primary-topic or
 tag match are listed before Circles without an interest match. Within each
 relevance group, eligible Circles are sorted by:
@@ -74,35 +87,7 @@ relevance group, eligible Circles are sorted by:
 2. Total recent post reactions and comments in the latest 30-day snapshot
    window.
 3. Most recent activity timestamp.
-4. Descending feed post count in the last 30 days.
-5. Descending chat message count in the last 30 days.
-6. Circle ID for deterministic tie-breaking.
-
-Leader Circles are a separate high-priority group. A user's leader memberships
-are returned first, ordered by Circle activity, even though those Circles are
-already joined. The regular eligibility filters do not apply to this group:
-capacity and public discoverability do not prevent an existing leader from
-being surfaced. Leader Circles count toward the requested result limit.
-
-A primary topic match always outranks a tag-only match. Tag overlap is a
-weaker relevance signal than the Circle's declared primary topic.
-
-Topic and tag matches remain ahead of unrelated Circles. The final section of
-the list contains the highest-activity eligible Circles without a topic/tag
-match, labeled “Trending HOT.” Within each relevance group, higher recent
-reaction/comment volume ranks first. Explanations include the aggregate counts
-used for this activity comparison.
-
-The active-member ratio is calculated for display, not ranking: count distinct
-post authors per Circle in the dataset's latest 30-day window, then divide by
-the Circle's `member_count`. The API returns a 0–1 ratio and includes the
-rounded percentage in the member-facing reason. If a Circle has zero members,
-its ratio is 0. The activity data identifies post authors but does not identify
-the members who reacted or commented, so they are not counted as distinct
-active members. The 30-day window ends at the latest timestamp among Circle
-activity summaries and feed posts in the snapshot. This ratio measures posting
-breadth; it is a heuristic, not proof that a Circle will be more conducive to
-newer members.
+4. Circle ID for deterministic tie-breaking.
 
 The first selection pass returns no more than two Circles per primary topic.
 If that leaves space and eligible Circles remain, a second pass fills the
@@ -112,37 +97,33 @@ Circles without a primary topic are treated as separate topics for diversity.
 Reasons say whether the member's interest matches the primary topic, matches a
 Circle tag, or neither, and mention the Circle's recent activity. With no
 primary-topic or tag match (including cold start), the reason stays general
-and does not claim a personal preference. Reasons also state the percentage of
-members who posted during the snapshot's latest 30-day window, plus recent
-reaction/comment totals when those totals are nonzero.
-Leader recommendations instead use: “You are a designated leader of this
-Circle — jump in to check recent member discussions.”
+and does not claim a personal preference.
 
-## Validation scenarios
+Reasons show “High member activity” when the active-member ratio is at least 0.4.
+If a Circle has zero members, its ratio is 0. Higher ratios should be conducive to
+newer members.
+The activity data identifies post authors but does not identify the members
+who reacted or commented, so they are not counted as distinct active members.
 
-- User 7: recommend Circles matching leadership skills and public speaking.
-- Rank a primary-topic match ahead of a tag-only match, and a tag-only match
-  ahead of a Circle with no interest match.
-- Within the same interest/tag relevance tier, prefer higher recent
-  reaction/comment volume and include those counts in the explanation.
-- Place high-activity Circles with no interest match after interest matches
-  and label those recommendations “Trending HOT.”
-- Count distinct post authors in the snapshot's latest 30-day window for the
-  active-member ratio, without changing recommendation ordering.
-- User 15: avoid filling the initial list with near-duplicate negotiation Circles.
-- User 23: exclude the full Promotion Path and stale Career Climbers; keep
-  Level Up Collective eligible.
-- User 42: return useful active/public recommendations without claiming an
-  interest match.
-- Return the user's leader Circles first, even though the user is already a
-  member, with the designated-leader explanation.
-- Also verify unknown users, limit bounds, existing memberships, and response
-  fields.
+Eligible Circles in the top quartile for combined recent reactions and
+comments receive the “High recent engagement” reason label.
 
-## Known first-version limitations
+## Production scale
 
-The JSON files are loaded once per API process, so changes require a restart.
-Activity freshness is a deliberately simple rule using the supplied aggregates.
-The ranker does not infer member interests from job, company, location, bio, or
-profile completeness. A later version can import the JSON into the documented
-SQLite schema and incorporate post engagement after validating that signal.
+This version loads the full JSON dataset into memory, which is simple but does
+not scale as data grows or changes. At larger scale, I would move the data to
+PostgreSQL and fetch only the candidate Circles needed for each request. I
+would also update activity aggregates outside the request path. If database
+reads later become a bottleneck, I would add Redis to cache frequently
+requested recommendations. Table updates would use separate transactional
+write operations, keeping recommendation calls focused on reading consistent
+data. Writes would invalidate affected cached recommendations if caching is
+added.
+
+## Notes
+
+With more time some features to consider:
+
+1. Evaluate recommendation outcomes and consider ML model with more data to train on
+2. Ability to parse the users.bio for improved understanding of user needs (can parse topics or slugs)
+3. Create a supplementary relationship table between topics and use to improve heuristics
