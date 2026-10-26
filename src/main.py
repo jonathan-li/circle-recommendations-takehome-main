@@ -6,11 +6,18 @@ from src.services.recommendations import recommend_circles
 users = {user["id"]: user for user in load_json("users.json")}
 circles = load_json("circles.json")
 memberships = load_json("memberships.json")
+activity = load_json("activity.json")
 topics = {topic["slug"]: topic["label"] for topic in load_json("topics.json")}
 user_circle_memberships = {
     (membership["user_id"], membership["circle_id"])
     for membership in memberships
 }
+user_leader_circles: dict[int, set[int]] = {}
+for membership in memberships:
+    if membership["role"] == "leader":
+        user_leader_circles.setdefault(membership["user_id"], set()).add(
+            membership["circle_id"]
+        )
 
 app = FastAPI(title="Circle Recommendations API")
 
@@ -35,6 +42,8 @@ def get_recommendations(
             user=user,
             circles=circles,
             memberships=user_circle_memberships,
+            leader_circle_ids=user_leader_circles.get(user_id, set()),
+            activity_records=activity,
             topic_labels=topics,
             limit=limit,
         ),

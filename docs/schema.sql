@@ -57,6 +57,24 @@ CREATE TABLE memberships (
     PRIMARY KEY (user_id, circle_id)
 );
 
+CREATE TABLE circle_tags (
+    circle_id INTEGER NOT NULL REFERENCES circles(id) ON DELETE CASCADE,
+    tag TEXT NOT NULL,
+    PRIMARY KEY (circle_id, tag)
+);
+
+CREATE TABLE activity (
+    id INTEGER PRIMARY KEY,
+    circle_id INTEGER NOT NULL REFERENCES circles(id) ON DELETE CASCADE,
+    author_user_id INTEGER NOT NULL REFERENCES users(id),
+    body TEXT NOT NULL,
+    reaction_count INTEGER NOT NULL CHECK (reaction_count >= 0),
+    comment_count INTEGER NOT NULL CHECK (comment_count >= 0),
+    save_count INTEGER NOT NULL CHECK (save_count >= 0),
+    created_at TEXT NOT NULL
+);
+
 CREATE INDEX idx_circles_topic ON circles(topic_id);
 CREATE INDEX idx_user_topic_interests_topic ON user_topic_interests(topic_id);
 CREATE INDEX idx_memberships_circle ON memberships(circle_id);
+CREATE INDEX idx_activity_circle_created_at ON activity(circle_id, created_at);
